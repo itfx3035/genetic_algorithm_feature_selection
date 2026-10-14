@@ -2,8 +2,6 @@
 
 A small Python library that finds feature subsets with a **genetic algorithm (GA)**. You supply an evaluation function that scores a feature subset; the GA evolves subsets (tournament selection, uniform crossover, bit-flip mutation, elitism) to minimize it.
 
-> **Experimental / Alpha.** Single-file library, no stability guarantees. The API and defaults may change. The "results" section below is a demonstration, not a benchmark.
-
 ---
 
 ## How it works
@@ -332,17 +330,6 @@ constraints (`min_features` / `max_features`) and `penalty_per_feature`, and
 parity (with explicit observability that the worker pool really ran). Each
 test's evaluator is tiny and deterministic, so the whole suite is fast and
 CI-friendly.
-
-## Project layout
-
-| File | Purpose |
-|---|---|
-| `ga_feature_selection_lib.py` | The library (self-test via `python ga_feature_selection_lib.py`). |
-| `example_usage.py` | End-to-end Wine Quality + RandomForest demo. |
-| `tests/` | Pytest suite (`python -m pytest tests/ -q`). |
-| `wine-quality-red.csv` | UCI Wine Quality (red), 1,599 rows, `;`-delimited, CC0. |
-| `pyproject.toml` | Installable as `pip install .` / `.[dev]` / `.[parallel]` / `.[test]`. |
-| `CHANGELOG.md` | Release history. |
 
 ## License
 
