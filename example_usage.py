@@ -1,191 +1,163 @@
 """
-Example usage of GA Feature Selection Library with scikit-learn RandomForest.
+Wine-quality demo: GA feature subset selection with a held-out test split.
 
-This script demonstrates how to use the genetic algorithm for feature selection
-with a RandomForest classifier from sklearn on real datasets.
+Pipeline:
+- one 80/20 stratified train/test split (fixed seed)
+- GA minimizes 5-fold cross-validation error on the TRAIN split only
+- final comparison fits on the full train split and scores the untouched
+  TEST split (so the GA never sees it)
+- n_jobs scores each generation's fresh subsets on worker processes.
+  The GA's own search is identical to the serial run for the same seed;
+  only the wall time changes. The evaluator here is a *closure*, so the
+  worker pool needs ``cloudpickle`` (``pip install cloudpickle``); without
+  it, the library falls back to serial with a warning and reports exactly
+  that on the final "Evaluation:" line.
+
+NOTE: the GA call sits inside ``if __name__ == "__main__":`` - required so
+that worker processes (forkserver start method) do not re-import and re-run
+this script.
 """
 
-import csv
-from typing import List, Tuple, Callable
-from ga_feature_selection_lib import GeneticFeatureSelector, select_features_with_ga
+import time
 
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
-def load_wine_quality_dataset(filepath: str = "wine-quality-red.csv") -> Tuple[List[List[float]], List[int], List[str]]:
-    """
-    Load Wine Quality dataset from UCI repository.
-    
-    Args:
-        filepath: Path to CSV file (semicolon-separated)
-        
-    Returns:
-        Tuple of (X as list of lists, y as list of labels, feature_names)
-    """
-    with open(filepath, 'r') as f:
-        reader = csv.reader(f, delimiter=';')
-        next(reader)
-        
-        X = []
-        y = []
-        feature_names = [
-            "fixed acidity", "volatile acidity", "citric acid", "residual sugar",
-            "chlorides", "free sulfur dioxide", "total sulfur dioxide",
-            "density", "pH", "sulphates", "alcohol"
-        ]
-        
-        for row in reader:
-            X.append([float(val) for val in row[:-1]])
-            y.append(int(row[-1]))
-            
-    return X, y, feature_names
+from ga_feature_selection_lib import GeneticFeatureSelector, build_binary_error
 
-
-def create_rf_evaluation_function(
-    X: List[List[float]], 
-    y: List[int],
-    feature_names: List[str], 
-    n_estimators: int = 100, 
-    random_state: int = 42
-) -> Callable[[List[str]], float]:
-    """Create evaluation function using RandomForest with cross-validation."""
-    try:
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.model_selection import cross_val_score, train_test_split
-        from sklearn.preprocessing import StandardScaler
-    except ImportError:
-        raise ImportError("scikit-learn is required.")
-    
-    feature_indices = {f: i for i, f in enumerate(feature_names)}
-    
-    def evaluation_func(selected_features: List[str]) -> float:
-        if not selected_features:
-            return 1.0
-        
-        feature_indices_selected = [feature_indices[f] for f in selected_features]
-        
-        X_subset = []
-        y_list = []
-        for row_idx, row in enumerate(X):
-            sel_row = [row[idx] for idx in feature_indices_selected]
-            X_subset.append(sel_row)
-            y_list.append(y[row_idx])
-        
-        X_train, X_temp, y_train, y_temp = train_test_split(
-            X_subset, y_list, test_size=0.2, random_state=random_state
-        )
-        
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        
-        rf_clf = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=15,
-            random_state=random_state,
-            n_jobs=-1
-        )
-        
-        scores = cross_val_score(rf_clf, X_train_scaled, y_train, cv=5, scoring='accuracy')
-        return 1.0 - scores.mean()
-    
-    return evaluation_func
+RANDOM_STATE = 42
 
 
 def main():
-    """Main function demonstrating GA feature selection with RandomForest."""
-    
-    print("=" * 60)
-    print("GA Feature Selection with RandomForest Demo")
-    print("=" * 60)
-    
-    # Step 1: Load Wine Quality dataset
-    print("\n[1] Loading Wine Quality dataset...")
-    X, y, feature_names = load_wine_quality_dataset("wine-quality-red.csv")
-    print(f"   Dataset shape: {len(X)} samples x {len(feature_names)} features")
-    
-    # Display target distribution
-    from collections import Counter
-    class_dist = Counter(y)
-    for cls in sorted(class_dist.keys()):
-        print(f"   Quality {cls}: {class_dist[cls]} samples ({class_dist[cls]/len(y)*100:.1f}%)")
-    
-    # Step 2: Define evaluation function
-    print("\n[2] Setting up RandomForest evaluation...")
-    eval_func = create_rf_evaluation_function(
-        X=X, y=y, feature_names=feature_names, n_estimators=100, random_state=42
+    # ------------------------------------------------------------------
+    # 1. Load + inspect
+    # ------------------------------------------------------------------
+    df = pd.read_csv("wine-quality-red.csv", sep=";")
+    df.columns = [c.strip() for c in df.columns]
+    print(df.head())
+    print(f"\nShape: {df.shape}")
+    print(f"Class balance:\n{df.quality.value_counts(normalize=True).sort_index()}")
+    print()
+
+    # ------------------------------------------------------------------
+    # 2. One train/test split; the GA only ever sees the train split
+    # ------------------------------------------------------------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        df.drop("quality", axis=1),
+        df["quality"],
+        test_size=0.2,
+        stratify=df["quality"],
+        random_state=RANDOM_STATE,
     )
-    
-    # Test evaluation function
-    test_result = eval_func(["alcohol"])
-    print(f"   Evaluation function returned error for 1 feature: {test_result:.4f}")
-    
-    # Step 3: Run GA feature selection
-    print("\n[3] Running Genetic Algorithm...")
-    print("-" * 50)
-    
-    selected_features, error = select_features_with_ga(
-        features=feature_names,
-        evaluation_function=eval_func,
-        population_size=50,
-        mutation_rate=0.02,
+    features = list(X_train.columns)
+    print(f"Train: {X_train.shape[0]} rows, Test: {X_test.shape[0]} rows, "
+          f"features: {len(features)}")
+
+    # ------------------------------------------------------------------
+    # 3. GA objective: 5-fold CV error on the TRAIN split
+    # ------------------------------------------------------------------
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    folds = list(skf.split(X_train, y_train))
+
+    def cv_error(selected):
+        """Training-CV error for a feature subset (lower is better).
+
+        Demonstrates the evaluator contract:
+        - any subset, including the empty one, may be passed in
+        - an empty subset cannot be scored: return None (marked invalid,
+          counted, and can never be the returned result)
+        - return a plain Python float (not np.float64)
+        """
+        if not selected:
+            return None
+        X = X_train[selected]
+        err = 0.0
+        for tr, te in folds:
+            model = RandomForestClassifier(n_estimators=60,
+                                          random_state=RANDOM_STATE)
+            model.fit(X.iloc[tr], y_train.iloc[tr])
+            preds = model.predict(X.iloc[te])
+            err += build_binary_error(list(preds), list(y_train.iloc[te]))
+        return err / len(folds)
+
+    GA_KWARGS = dict(
+        population_size=30,
+        mutation_rate=0.03,
+        elite_size=5,
+        tournament_size=3,
         max_generations=40,
-        verbose=True
+        stall_generations=3,
+        random_state=RANDOM_STATE,
     )
-    
-    # Step 4: Results
-    print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-    print(f"\nOriginal feature set size: {len(feature_names)}")
-    print(f"Selected feature count: {len(selected_features)}")
-    print(f"Error metric (1 - accuracy): {error:.4f}")
-    print(f"\nSelected features (in rank order):")
-    for i, feat in enumerate(selected_features, 1):
-        print(f"   {i}. {feat}")
-    
-    # Step 5: Baseline comparison (all features)
-    print("\n[4] Running baseline with ALL features...")
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import cross_val_score
-    from sklearn.preprocessing import StandardScaler
-    
-    rf_baseline = RandomForestClassifier(
-        n_estimators=100, max_depth=15, random_state=42, n_jobs=-1
+
+    # ------------------------------------------------------------------
+    # 4. The GA run
+    # ------------------------------------------------------------------
+    import os
+    n_jobs = int(os.environ.get("GA_NJOBS", "2"))  # 0 = serial
+
+    start = time.perf_counter()
+    selector = GeneticFeatureSelector(
+        features, cv_error,
+        n_jobs=n_jobs if n_jobs >= 2 else None,
+        **GA_KWARGS,
     )
-    X_scaled_full = StandardScaler().fit_transform(X)
-    
-    baseline_scores = cross_val_score(rf_baseline, X_scaled_full, y, cv=5, scoring='accuracy')
-    baseline_error = 1.0 - baseline_scores.mean()
-    
-    print(f"\nBaseline (all {len(feature_names)} features):")
-    print(f"   CV Accuracy: {baseline_scores.mean():.4f} (+/- {baseline_scores.std():.4f})")
-    print(f"   Error metric: {baseline_error:.4f}")
-    print(f"\nGA Selected (8 features):")
-    print(f"   CV Accuracy: {1.0 - error:.4f} (+/- {(eval_func(selected_features) if len(selected_features) > 0 else 1.0):.4f})")
-    print(f"   Error metric: {error:.4f}")
-    
-    improvement = baseline_error - error
-    print(f"\nFeature Selection Improvement:")
-    print(f"   Accuracy gain: {improvement:.4f} ({improvement*100:.1f} relative)")
-    
-    # Step 6: Display feature details for GA-selected features
-    print("\n[5] Detailed analysis of selected features...")
-    import pandas as pd
-    
-    df = pd.DataFrame(X, columns=feature_names)
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
-    
-    rf_full = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    rf_full.fit(X_scaled_full, y_encoded)
-    
-    print("\nFeature Importance (from full model):")
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': rf_full.feature_importances_
-    }).sort_values('importance', ascending=False)
-    for _, row in importance_df.iterrows():
-        marker = " <-- SELECTED" if row['feature'] in selected_features else ""
-        print(f"   {row['feature']}: {row['importance']:.4f}{marker}")
+    best_subset, best_train_err = selector.run()
+    elapsed = time.perf_counter() - start
+
+    mode = (f"SERIAL fallback - {selector.parallel_unavailable_reason}"
+            if (n_jobs >= 2 and selector.parallel_unavailable_reason)
+            else f"n_jobs={n_jobs} (worker pool)" if n_jobs >= 2
+            else "serial")
+    print(f"\nGA wall time (60-tree RF, 5-fold CV, {mode}): {elapsed:.1f}s")
+    print(f"Unique subsets scored: {selector.unique_evaluations} (no re-eval)")
+    print(f"Invalid evaluations:   {selector.invalid_evaluation_count}")
+    print(f"Best training-CV error: {best_train_err:.4f}")
+    print(f"Selected features ({len(best_subset)}/{len(features)}): "
+          f"{best_subset}\n")
+
+    print("Per-generation history:")
+    for row in selector.history:
+        print(f"  g{row['generation']:>2} | best so far "
+              f"{row['best_error']:.4f} | new subsets "
+              f"{row['new_evaluations']:>2} | total {row['unique_evaluations']:>3}")
+
+    print("\nFeature prevalence (share of top-30 subsets containing the feature):")
+    for row in selector.feature_prevalence(top_k=30):
+        print(f"  {row['feature']:<22s} {row['prevalence']:.2f}"
+              f"   ({row['count']}/{row['of']})")
+
+    print("\nTop 5 lowest-CV-error subsets scored:")
+    for row in selector.top_subsets(5):
+        print(f"  n={len(row['features'])}  err={row['error']:.4f}  "
+              f"{row['features']}")
+
+    # ------------------------------------------------------------------
+    # 5. GA subset vs. all features, on the untouched TEST split
+    #    (same model the GA optimized - apples to apples, fit once on
+    #    the full train set)
+    # ------------------------------------------------------------------
+    def evaluate_on_test(cols):
+        model = RandomForestClassifier(n_estimators=60,
+                                      random_state=RANDOM_STATE)
+        model.fit(X_train[cols], y_train)
+        return model.score(X_test[cols], y_test), model
+
+    acc_ga, _ = evaluate_on_test(best_subset)
+    acc_all, model_all = evaluate_on_test(features)
+
+    print(f"\nTest accuracy (RandomForest) | all {len(features)} features: "
+          f"{acc_all:.4f} |"
+          f" GA {len(best_subset)}-feature subset: {acc_ga:.4f}")
+    print("Test-set accuracy is a single demonstration on one held-out "
+          "split, not an independent benchmark.")
+
+    print("\nFeature importances (RandomForest on the full train set):")
+    for name, imp in sorted(zip(model_all.feature_names_in_,
+                                model_all.feature_importances_),
+                            key=lambda t: -t[1]):
+        print(f"  {name:<22s} {imp:.4f}")
 
 
 if __name__ == "__main__":
